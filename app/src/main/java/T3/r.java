@@ -8,6 +8,8 @@ import android.view.ViewGroup;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.File;
+
 import bridge.NativeBridge;
 import org.tvp.kirikiri2.KR2Activity;
 
@@ -41,11 +43,48 @@ public abstract class r extends KR2Activity {
             finish();
         }
     }
-
     @Override
     public void onLoadNativeLibraries() {
-        NativeBridge.initialize(soName());
+        boolean initialized = NativeBridge.initialize(soName());
+        Log.i(TAG, "native initialize result=" + initialized + " so=" + soName());
+        Intent intent = getIntent();
+        boolean scopedSaveDir = intent != null && intent.getBooleanExtra("scopedSaveDir", false);
+        boolean safFileFallback = intent != null && intent.getBooleanExtra("safFileFallback", false);
+        if (intent == null || (!scopedSaveDir && !safFileFallback)) {
+            Log.i(TAG, "native interceptor skipped: scoped save and SAF fallback disabled");
+            return;
+        }
+        String prefix = null;
+        try {
+            String rawPath = intent.getStringExtra("path");
+            if (rawPath != null && !rawPath.trim().isEmpty()) {
+                String resolved = normalizeKrPath(rawPath);
+                File root = new File(resolved);
+                if (root.isFile()) root = root.getParentFile();
+                if (root != null) {
+                    File saveRoot = new File(new File(getExternalFilesDir(null), "save"), safeSaveName(root.getAbsolutePath()));
+                    if (saveRoot.exists() || saveRoot.mkdirs()) {
+                        Log.i(TAG, scopedSaveDir ? "KRKR scoped save uses private mirror root; native save hook enabled" : "KRKR SAF file fallback hook enabled");
+                        prefix = storagePrefix(root.getAbsolutePath());
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "resolve scoped hook prefix failed", t);
+        }
+        if (prefix != null) {
+            try {
+                NativeBridge.interceptor(prefix);
+                NativeBridge.relocate();
+                Log.i(TAG, "native interceptor enabled prefix=" + prefix);
+            } catch (Throwable t) {
+                Log.e(TAG, "enable native interceptor failed", t);
+            }
+        } else {
+            Log.w(TAG, "native interceptor skipped: empty prefix");
+        }
     }
+
 
     private void tryLaunchGame(String path, boolean maps) {
         new Thread(() -> {
@@ -76,6 +115,44 @@ public abstract class r extends KR2Activity {
         }).start();
     }
 
+    private static String normalizeKrPath(String path) {
+        if (path == null) return "";
+        String p = path.trim();
+        if (p.startsWith("file://")) p = p.substring("file://".length());
+        while (p.startsWith("./")) p = p.substring(2);
+        if (p.startsWith("storage/")) p = "/" + p;
+        return p;
+    }
+
+    private static String storagePrefix(String path) {
+        String p = normalizeKrPath(path);
+        String lower = p.toLowerCase();
+        if (lower.startsWith("/storage/emulated/0/")) return "/storage/emulated/0";
+        if (lower.startsWith("/sdcard/")) return "/sdcard";
+        if (lower.startsWith("/storage/")) {
+            String rest = p.substring("/storage/".length());
+            int slash = rest.indexOf('/');
+            if (slash > 0) return "/storage/" + rest.substring(0, slash);
+        }
+        return p;
+    }
+
+    private static String safeSaveName(String rootPath) {
+        try {
+            String path = normalizeKrPath(rootPath);
+            File f = new File(path);
+            String name = f.getName();
+            if (name == null || name.trim().isEmpty()) {
+                File parent = f.getParentFile();
+                name = parent == null ? "default" : parent.getName();
+            }
+            name = name == null ? "default" : name.trim().replaceAll("[\\\\/:*?\"<>|]", "_");
+            return name.isEmpty() ? "default" : name;
+        } catch (Throwable ignored) {
+            return "default";
+        }
+    }
+
     @Override
     public void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
@@ -100,6 +177,42 @@ public abstract class r extends KR2Activity {
         boolean forceFocus = focus != null && Boolean.parseBoolean(focus);
         super.onWindowFocusChanged(hasFocus || forceFocus);
         if (hasFocus || forceFocus) doSetSystemUiVisibility();
+    }
+
+    @Override
+    public void onDestroy() {
+        boolean terminateProcess = shouldTerminateProcessAfterDestroy();
+        try {
+            mask = null;
+            if (app == this) app = null;
+        } catch (Throwable ignored) { }
+        super.onDestroy();
+        if (!isChangingConfigurations() && terminateProcess) {
+            Log.i(TAG, "terminate Huawei KR wrapper process after destroy to avoid stale native state");
+            android.os.Process.killProcess(android.os.Process.myPid());
+        }
+    }
+
+    private boolean shouldTerminateProcessAfterDestroy() {
+        try {
+            Intent intent = getIntent();
+            if (intent == null) return false;
+            boolean safRoot = false;
+            String rootUri = intent.getStringExtra("rootUri");
+            if (rootUri != null) safRoot = rootUri.trim().toLowerCase(java.util.Locale.ROOT).startsWith("content://");
+            boolean specialLaunch = safRoot
+                    || intent.getBooleanExtra("compatMode", false)
+                    || intent.getBooleanExtra("safFileFallback", false)
+                    || intent.getBooleanExtra("scopedSaveDir", false)
+                    || "1.3.4".equals(intent.getStringExtra("krEngineVersion"));
+            if (!specialLaunch) return false;
+            String brand = String.valueOf(android.os.Build.BRAND).toLowerCase(java.util.Locale.ROOT);
+            String manufacturer = String.valueOf(android.os.Build.MANUFACTURER).toLowerCase(java.util.Locale.ROOT);
+            return brand.contains("huawei") || brand.contains("honor")
+                    || manufacturer.contains("huawei") || manufacturer.contains("honor");
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     public abstract String soName();

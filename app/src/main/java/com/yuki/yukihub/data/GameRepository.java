@@ -55,9 +55,13 @@ public class GameRepository {
     public boolean existsByRootUri(String rootUri) {
         if (rootUri == null || rootUri.trim().isEmpty()) return false;
         SQLiteDatabase db = helper.getReadableDatabase();
-        Cursor c = db.rawQuery("SELECT id FROM games WHERE root_uri=? LIMIT 1", new String[]{rootUri});
+        String key = normalizeRootUriKey(rootUri);
+        Cursor c = db.rawQuery("SELECT root_uri FROM games WHERE root_uri IS NOT NULL AND root_uri != ''", null);
         try {
-            return c.moveToFirst();
+            while (c.moveToNext()) {
+                if (key.equals(normalizeRootUriKey(c.getString(0)))) return true;
+            }
+            return false;
         } finally {
             c.close();
         }
@@ -69,6 +73,18 @@ public class GameRepository {
         Cursor c = db.rawQuery("SELECT root_uri FROM games WHERE root_uri IS NOT NULL AND root_uri != ''", null);
         try {
             while (c.moveToNext()) set.add(c.getString(0));
+        } finally {
+            c.close();
+        }
+        return set;
+    }
+
+    public Set<String> getRootUriKeySet() {
+        Set<String> set = new HashSet<>();
+        SQLiteDatabase db = helper.getReadableDatabase();
+        Cursor c = db.rawQuery("SELECT root_uri FROM games WHERE root_uri IS NOT NULL AND root_uri != ''", null);
+        try {
+            while (c.moveToNext()) set.add(normalizeRootUriKey(c.getString(0)));
         } finally {
             c.close();
         }
@@ -90,19 +106,6 @@ public class GameRepository {
     public int delete(long id) {
         SQLiteDatabase db = helper.getWritableDatabase();
         return db.delete("games", "id=?", new String[]{String.valueOf(id)});
-    }
-
-    public void clearPlayTimeForGame(long gameId) {
-        if (gameId <= 0) return;
-        SQLiteDatabase db = helper.getWritableDatabase();
-        long now = System.currentTimeMillis();
-        db.delete("play_sessions", "game_id=?", new String[]{String.valueOf(gameId)});
-        ContentValues v = new ContentValues();
-        v.put("total_play_time", 0L);
-        v.put("last_played_at", 0L);
-        v.put("playtime_reset_at", now);
-        v.put("updated_at", now);
-        db.update("games", v, "id=?", new String[]{String.valueOf(gameId)});
     }
 
     public long startPlaySession(long gameId, long start, String launchType) {
@@ -172,6 +175,42 @@ public class GameRepository {
             c.close();
         }
         for (Long id : ids) finishPlaySession(id, end, minDuration, maxDuration);
+    }
+
+    public PlayActivity findLatestOpenPlaySession() {
+        SQLiteDatabase db = helper.getReadableDatabase();
+        Cursor c = db.rawQuery(
+                "SELECT ps.id,ps.session_uuid,ps.game_id,g.title,ps.start_time,ps.end_time,ps.duration,ps.launch_type " +
+                        "FROM play_sessions ps JOIN games g ON g.id=ps.game_id " +
+                        "WHERE ps.end_time IS NULL AND IFNULL(ps.deleted,0)=0 " +
+                        "ORDER BY ps.start_time DESC LIMIT 1", null);
+        try {
+            if (!c.moveToFirst()) return null;
+            PlayActivity a = new PlayActivity();
+            a.sessionId = c.getLong(0);
+            a.sessionUuid = c.getString(1);
+            a.gameId = c.getLong(2);
+            a.gameTitle = c.getString(3);
+            a.startTime = c.getLong(4);
+            a.endTime = 0L;
+            a.duration = c.getLong(6);
+            a.launchType = c.getString(7);
+            if (a.gameTitle == null || a.gameTitle.trim().isEmpty()) a.gameTitle = "未命名游戏";
+            return a;
+        } finally {
+            c.close();
+        }
+    }
+
+    public int deleteOpenPlaySessions() {
+        SQLiteDatabase db = helper.getWritableDatabase();
+        return db.delete("play_sessions", "end_time IS NULL", null);
+    }
+
+    public int deleteOpenPlaySession(long sessionId) {
+        if (sessionId <= 0) return 0;
+        SQLiteDatabase db = helper.getWritableDatabase();
+        return db.delete("play_sessions", "id=? AND end_time IS NULL", new String[]{String.valueOf(sessionId)});
     }
 
     public void addPlayTime(long gameId, long start, long end, long duration) {
@@ -345,7 +384,7 @@ o.put("description", c.getString(c.getColumnIndexOrThrow("description")));
     public JSONArray exportPlaySessionsJson() throws Exception {
         JSONArray arr = new JSONArray();
         SQLiteDatabase db = helper.getReadableDatabase();
-        Cursor c = db.rawQuery("SELECT ps.*, g.root_uri, g.title AS game_title, g.engine AS game_engine, g.emulator_package AS game_emulator_package, g.gamehub_local_game_id AS gamehub_local_game_id, g.gaishi_local_game_id AS gaishi_local_game_id FROM play_sessions ps LEFT JOIN games g ON g.id=ps.game_id WHERE IFNULL(ps.deleted,0)=0 AND COALESCE(ps.end_time,ps.start_time,0)>IFNULL(g.playtime_reset_at,0) ORDER BY ps.start_time ASC", null);
+        Cursor c = db.rawQuery("SELECT ps.*, g.root_uri, g.title AS game_title, g.engine AS game_engine, g.emulator_package AS game_emulator_package, g.gamehub_local_game_id AS gamehub_local_game_id, g.gaishi_local_game_id AS gaishi_local_game_id FROM play_sessions ps LEFT JOIN games g ON g.id=ps.game_id WHERE IFNULL(ps.deleted,0)=0 AND COALESCE(ps.end_time,ps.start_time,0)>=IFNULL(g.playtime_reset_at,0) ORDER BY ps.start_time ASC", null);
         try {
             while (c.moveToNext()) {
                 JSONObject o = new JSONObject();
@@ -386,42 +425,73 @@ o.put("description", c.getString(c.getColumnIndexOrThrow("description")));
             Game g = findBySyncIdentity(o, rootUri);
             boolean exists = g != null;
             if (g == null) g = new Game();
-            g.title = o.optString("title", g.title == null ? "未命名游戏" : g.title);
-            g.originalTitle = o.optString("original_title", g.originalTitle);
-            g.engine = EngineType.fromString(o.optString("engine", g.engine == null ? EngineType.UNKNOWN.name() : g.engine.name()));
-            g.rootUri = rootUri;
-            g.coverUri = o.optString("cover_uri", g.coverUri);
-            g.coverPersistUri = o.optString("cover_persist_uri", g.coverPersistUri);
-            g.coverSourceType = o.optInt("cover_source_type", g.coverSourceType);
-            g.emulatorPackage = o.optString("emulator_package", g.emulatorPackage);
-            g.launchTarget = o.optString("launch_target", g.launchTarget);
-g.winlatorLaunchMode = normalizeWinlatorLaunchMode(o.optString("winlator_launch_mode", g.winlatorLaunchMode));
-g.description = o.optString("description", g.description);
-            g.tags = o.optString("tags", g.tags);
-            g.gamehubLocalGameId = o.optString("gamehub_local_game_id", o.optString("gaishi_local_game_id", g.gamehubLocalGameId));
-            g.gamehubLaunchMode = normalizeGameHubLaunchMode(o.optString("gamehub_launch_mode", g.gamehubLaunchMode));
-            g.playStatus = normalizePlayStatus(o.optString("play_status", g.playStatus));
-            long incomingResetAt = o.optLong("playtime_reset_at", 0L);
+            long existingUpdatedAt = exists ? Math.max(0L, g.updatedAt) : 0L;
+            long incomingUpdatedAt = Math.max(0L, o.optLong("updated_at", existingUpdatedAt));
+            boolean applyDetails = !exists || incomingUpdatedAt >= existingUpdatedAt;
+            if (applyDetails) {
+                g.title = o.optString("title", g.title == null ? "未命名游戏" : g.title);
+                g.originalTitle = o.optString("original_title", g.originalTitle);
+                g.engine = EngineType.fromString(o.optString("engine", g.engine == null ? EngineType.UNKNOWN.name() : g.engine.name()));
+                if (!rootUri.isEmpty() || g.rootUri == null || g.rootUri.trim().isEmpty()) g.rootUri = rootUri;
+                g.coverUri = o.optString("cover_uri", g.coverUri);
+                g.coverPersistUri = o.optString("cover_persist_uri", g.coverPersistUri);
+                g.coverSourceType = o.optInt("cover_source_type", g.coverSourceType);
+                g.emulatorPackage = o.optString("emulator_package", g.emulatorPackage);
+                g.launchTarget = o.optString("launch_target", g.launchTarget);
+                g.winlatorLaunchMode = normalizeWinlatorLaunchMode(o.optString("winlator_launch_mode", g.winlatorLaunchMode));
+                g.description = o.optString("description", g.description);
+                g.tags = o.optString("tags", g.tags);
+                g.gamehubLocalGameId = o.optString("gamehub_local_game_id", o.optString("gaishi_local_game_id", g.gamehubLocalGameId));
+                g.gamehubLaunchMode = normalizeGameHubLaunchMode(o.optString("gamehub_launch_mode", g.gamehubLaunchMode));
+                g.playStatus = normalizePlayStatus(o.optString("play_status", g.playStatus));
+                g.hidden = o.optBoolean("hidden", g.hidden);
+                g.favorite = o.optBoolean("favorite", g.favorite);
+            } else {
+                // Older card metadata must not overwrite newer local edits, but it may
+                // still fill identity fields that are missing locally.
+                if ((g.rootUri == null || g.rootUri.trim().isEmpty()) && !rootUri.isEmpty()) g.rootUri = rootUri;
+                if ((g.gamehubLocalGameId == null || g.gamehubLocalGameId.trim().isEmpty())) {
+                    g.gamehubLocalGameId = o.optString("gamehub_local_game_id", o.optString("gaishi_local_game_id", g.gamehubLocalGameId));
+                }
+            }
+            if (g.title == null || g.title.trim().isEmpty()) g.title = "未命名游戏";
+            if (g.engine == null) g.engine = EngineType.UNKNOWN;
+            long incomingResetAt = Math.max(0L, o.optLong("playtime_reset_at", 0L));
+            long incomingTotalPlayTime = Math.max(0L, o.optLong("total_play_time", 0L));
+            long incomingLastPlayedAt = Math.max(0L, o.optLong("last_played_at", 0L));
             boolean resetAdvanced = incomingResetAt > g.playtimeResetAt;
             if (resetAdvanced) {
+                // A newer reset/manual-set on another device is an explicit operation;
+                // accept its aggregate value and discard older local sessions below.
                 g.playtimeResetAt = incomingResetAt;
-                g.totalPlayTime = o.optLong("total_play_time", 0L);
-                g.lastPlayedAt = o.optLong("last_played_at", 0L);
+                g.totalPlayTime = incomingTotalPlayTime;
+                g.lastPlayedAt = incomingLastPlayedAt;
+            } else if (incomingResetAt == g.playtimeResetAt) {
+                // Total play time is cumulative. During smart merge or normal download,
+                // never let an older/empty device overwrite a larger aggregate with 0.
+                g.totalPlayTime = Math.max(g.totalPlayTime, incomingTotalPlayTime);
+                g.lastPlayedAt = Math.max(g.lastPlayedAt, incomingLastPlayedAt);
             } else {
-                g.totalPlayTime = Math.max(g.totalPlayTime, o.optLong("total_play_time", g.totalPlayTime));
-                g.lastPlayedAt = Math.max(g.lastPlayedAt, o.optLong("last_played_at", g.lastPlayedAt));
-                g.playtimeResetAt = Math.max(g.playtimeResetAt, incomingResetAt);
+                // Local reset is newer. Ignore incoming aggregate to avoid resurrecting
+                // play time that was intentionally cleared locally. Newer sessions, if any,
+                // can still be imported by importPlaySessionsJson() when they pass resetAt.
             }
             g.createdAt = o.optLong("created_at", g.createdAt);
             g.updatedAt = Math.max(g.updatedAt, o.optLong("updated_at", g.updatedAt));
-            g.hidden = o.optBoolean("hidden", g.hidden);
-            g.favorite = o.optBoolean("favorite", g.favorite);
-            if (exists) update(g); else insert(g);
+            if (g.createdAt <= 0) g.createdAt = System.currentTimeMillis();
+            if (g.updatedAt <= 0) g.updatedAt = g.createdAt;
+            if (exists) {
+                db.update("games", toValues(g), "id=?", new String[]{String.valueOf(g.id)});
+            } else {
+                long id = db.insert("games", null, toValues(g));
+                g.id = id;
+            }
             if (resetAdvanced && g.id > 0) {
                 db.delete("play_sessions", "game_id=? AND (COALESCE(end_time,start_time,0) <= ?)", new String[]{String.valueOf(g.id), String.valueOf(g.playtimeResetAt)});
             }
             changed++;
         }
+        recalculatePlayStats();
         return changed;
     }
 
@@ -434,8 +504,15 @@ g.description = o.optString("description", g.description);
             if (o == null) continue;
             String uuid = o.optString("session_uuid", "").trim();
             if (uuid.isEmpty()) uuid = UUID.randomUUID().toString();
-            Cursor dup = db.rawQuery("SELECT id FROM play_sessions WHERE session_uuid=? LIMIT 1", new String[]{uuid});
-            try { if (dup.moveToFirst()) continue; } finally { dup.close(); }
+            Cursor dup = db.rawQuery("SELECT id,updated_at FROM play_sessions WHERE session_uuid=? LIMIT 1", new String[]{uuid});
+            long existingSessionId = -1L;
+            long existingUpdatedAt = 0L;
+            try {
+                if (dup.moveToFirst()) {
+                    existingSessionId = dup.getLong(0);
+                    existingUpdatedAt = dup.getLong(1);
+                }
+            } finally { dup.close(); }
             String rootUri = o.optString("game_root_uri", "").trim();
             Game g = findByRootUri(rootUri);
             if (g == null) {
@@ -452,20 +529,26 @@ g.description = o.optString("description", g.description);
             long endTime = o.has("end_time") && !o.isNull("end_time") ? o.optLong("end_time") : 0L;
             long startTime = o.optLong("start_time", 0L);
             long sessionTime = endTime > 0 ? endTime : startTime;
-            if (g.playtimeResetAt > 0 && sessionTime > 0 && sessionTime <= g.playtimeResetAt) continue;
+            if (g.playtimeResetAt > 0 && sessionTime > 0 && sessionTime < g.playtimeResetAt) continue;
+            long incomingUpdatedAt = o.optLong("updated_at", System.currentTimeMillis());
+            if (existingSessionId > 0 && incomingUpdatedAt < existingUpdatedAt) continue;
             ContentValues v = new ContentValues();
             v.put("game_id", g.id);
             v.put("start_time", o.optLong("start_time", 0));
             if (o.has("end_time") && !o.isNull("end_time")) v.put("end_time", o.optLong("end_time")); else v.putNull("end_time");
-            v.put("duration", o.optLong("duration", 0));
+            v.put("duration", Math.max(0L, o.optLong("duration", 0)));
             v.put("launch_type", o.optString("launch_type", "external"));
             v.put("session_uuid", uuid);
             v.put("device_id", o.optString("device_id", "imported"));
             v.put("created_at", o.optLong("created_at", o.optLong("start_time", 0)));
-            v.put("updated_at", o.optLong("updated_at", System.currentTimeMillis()));
+            v.put("updated_at", incomingUpdatedAt);
             v.put("dirty", 1);
             v.put("deleted", 0);
-            db.insert("play_sessions", null, v);
+            if (existingSessionId > 0) {
+                db.update("play_sessions", v, "id=?", new String[]{String.valueOf(existingSessionId)});
+            } else {
+                db.insert("play_sessions", null, v);
+            }
             changed++;
         }
         recalculatePlayStats();
@@ -474,17 +557,24 @@ g.description = o.optString("description", g.description);
 
     public void recalculatePlayStats() {
         SQLiteDatabase db = helper.getWritableDatabase();
-        db.execSQL("UPDATE games SET total_play_time=0,last_played_at=0");
-        db.execSQL("UPDATE games SET total_play_time=IFNULL((SELECT SUM(duration) FROM play_sessions WHERE game_id=games.id AND end_time IS NOT NULL AND IFNULL(deleted,0)=0 AND end_time>IFNULL(games.playtime_reset_at,0)),0), last_played_at=IFNULL((SELECT MAX(end_time) FROM play_sessions WHERE game_id=games.id AND end_time IS NOT NULL AND IFNULL(deleted,0)=0 AND end_time>IFNULL(games.playtime_reset_at,0)),0)");
+        // Preserve imported/manual aggregate play time when the synced snapshot only
+        // contains a limited tail of play_sessions. Explicit clear/manual reset is
+        // represented by a newer playtime_reset_at plus the aggregate value imported
+        // in importGamesJson(), so this method must never blindly lower totals.
+        db.execSQL("UPDATE games SET total_play_time=MAX(IFNULL(total_play_time,0),IFNULL((SELECT SUM(duration) FROM play_sessions WHERE game_id=games.id AND end_time IS NOT NULL AND IFNULL(deleted,0)=0 AND end_time>=IFNULL(games.playtime_reset_at,0)),0)), last_played_at=MAX(IFNULL(last_played_at,0),IFNULL((SELECT MAX(end_time) FROM play_sessions WHERE game_id=games.id AND end_time IS NOT NULL AND IFNULL(deleted,0)=0 AND end_time>=IFNULL(games.playtime_reset_at,0)),0))");
     }
 
     private Game findByRootUri(String rootUri) {
         if (rootUri == null || rootUri.trim().isEmpty()) return null;
         SQLiteDatabase db = helper.getReadableDatabase();
-        Cursor c = db.query("games", null, "root_uri=?", new String[]{rootUri}, null, null, null, "1");
+        String key = normalizeRootUriKey(rootUri);
+        Cursor c = db.query("games", null, "root_uri IS NOT NULL AND root_uri != ''", null, null, null, null);
         try {
-            if (!c.moveToFirst()) return null;
-            return fromCursor(c);
+            while (c.moveToNext()) {
+                Game g = fromCursor(c);
+                if (key.equals(normalizeRootUriKey(g.rootUri))) return g;
+            }
+            return null;
         } finally {
             c.close();
         }
@@ -558,7 +648,7 @@ g.description = o.optString("description", g.description);
         v.put("cover_persist_uri", g.coverPersistUri);
         v.put("cover_source_type", g.coverSourceType);
         v.put("emulator_package", g.emulatorPackage);
-        v.put("launch_target", g.launchTarget == null || g.launchTarget.isEmpty() ? "data.xp3" : g.launchTarget);
+        v.put("launch_target", g.launchTarget == null || g.launchTarget.isEmpty() ? "[游戏目录]" : g.launchTarget);
 v.put("winlator_launch_mode", normalizeWinlatorLaunchMode(g.winlatorLaunchMode));
 v.put("description", g.description);
         v.put("tags", g.tags);
@@ -588,7 +678,7 @@ v.put("description", g.description);
         g.coverSourceType = getIntOrDefault(c, "cover_source_type", 0);
         g.emulatorPackage = c.getString(c.getColumnIndexOrThrow("emulator_package"));
         g.launchTarget = getStringOrNull(c, "launch_target");
-if (g.launchTarget == null || g.launchTarget.isEmpty()) g.launchTarget = "data.xp3";
+if (g.launchTarget == null || g.launchTarget.isEmpty()) g.launchTarget = "[游戏目录]";
 g.winlatorLaunchMode = normalizeWinlatorLaunchMode(getStringOrNull(c, "winlator_launch_mode"));
 g.description = c.getString(c.getColumnIndexOrThrow("description"));
         g.tags = c.getString(c.getColumnIndexOrThrow("tags"));
@@ -648,5 +738,25 @@ g.description = c.getString(c.getColumnIndexOrThrow("description"));
 
     private String nvl(String value) {
         return value == null ? "" : value;
+    }
+
+    public static String normalizeRootUriKey(String value) {
+        if (value == null) return "";
+        String s = value.trim();
+        if (s.startsWith("file://")) s = s.substring("file://".length());
+        try {
+            if (s.startsWith("content://")) {
+                android.net.Uri uri = android.net.Uri.parse(s);
+                String docId = null;
+                try { docId = android.provider.DocumentsContract.getDocumentId(uri); } catch (Throwable ignored) { }
+                if (docId == null || docId.isEmpty()) {
+                    try { docId = android.provider.DocumentsContract.getTreeDocumentId(uri); } catch (Throwable ignored) { }
+                }
+                if (docId != null && !docId.isEmpty()) s = android.net.Uri.decode(docId);
+            }
+        } catch (Throwable ignored) { }
+        while (s.contains("//")) s = s.replace("//", "/");
+        while (s.endsWith("/") && s.length() > 1) s = s.substring(0, s.length() - 1);
+        return s.toLowerCase(java.util.Locale.ROOT);
     }
 }

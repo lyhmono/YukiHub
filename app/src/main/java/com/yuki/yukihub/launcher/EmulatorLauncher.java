@@ -8,11 +8,17 @@ import android.content.pm.ShortcutInfo;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.FileObserver;
 import android.provider.DocumentsContract;
+import android.system.ErrnoException;
+import android.system.Os;
 import android.util.Log;
 import androidx.documentfile.provider.DocumentFile;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -20,6 +26,8 @@ import java.util.Locale;
 import com.yuki.yukihub.ons.OnsSettings;
 
 public class EmulatorLauncher {
+    private static final List<FileObserver> ARTEMIS_SAVE_OBSERVERS = new ArrayList<>();
+
     public static boolean launchGame(Context context, String packageName, String rootUri, String launchTarget) {
         return launchGame(context, packageName, rootUri, launchTarget, "game", null);
     }
@@ -57,8 +65,8 @@ if (packageName == null || packageName.trim().isEmpty()) return false;
             return false;
         }
         if ("internal.artemis".equalsIgnoreCase(pkg) || "com.yuki.yukihub.artemis".equalsIgnoreCase(pkg)
-                || "internal.artemis.compat".equalsIgnoreCase(pkg) || "internal.artemis.compatible".equalsIgnoreCase(pkg)
-                || "internal.artemis.compat.v2".equalsIgnoreCase(pkg) || "internal.artemis.compatible.v2".equalsIgnoreCase(pkg)) {
+            || "internal.artemis.compat".equalsIgnoreCase(pkg) || "internal.artemis.compatible".equalsIgnoreCase(pkg)
+            || "internal.artemis.compat.v2".equalsIgnoreCase(pkg) || "internal.artemis.compatible.v2".equalsIgnoreCase(pkg)) {
             try {
                 context.startActivity(buildInternalArtemisIntent(context, pkg, rootUri, launchTarget));
                 return true;
@@ -108,7 +116,7 @@ if (rootUri != null && !rootUri.trim().isEmpty()) {
         String target = launchTarget == null ? "" : launchTarget;
         if ("com.akira.tyranoemu".equals(pkg)) {
             return new Intent[]{
-                    // Tyranor 2.3.4 exposes this action for web/Tyrano games.
+                    // Some external players expose this action for web/Tyrano games.
                     explicit("com.akira.tyranoemu", "com.akira.tyranoemu.remote.WebActivity", "android.intent.action.WebGame", uri)
                             .putExtra("path", uriText).putExtra("uri", uriText).putExtra("projectRoot", rootText)
                             .putExtra("launchFile", target).putExtra("filename", target).putExtra("game", uriText)
@@ -169,9 +177,9 @@ if (rootUri != null && !rootUri.trim().isEmpty()) {
         String desktopPath = resolveDesktopPath(context, rootUri, launchTarget);
         if (desktopPath == null || desktopPath.trim().isEmpty()) return false;
         int containerId = parseWinlatorContainerId(desktopPath);
-        String execPath = resolveWinlatorExecPathFromDesktop(desktopPath);
+        String execPath = resolveWinlatorExecPathFromDesktop(desktopPath, pkg);
         boolean legacyRootfsShortcut = isWinlatorLegacyRootfsShortcut(desktopPath);
-        // WinlatorCN/官版受限 Activity 强制启动需要 container_id；解析不到时默认使用第一个容器。
+        // Winlator/WinlatorCN/glibc/proot/mobox 等改包直启通常需要 container_id；解析不到时默认使用第一个容器。
         if (containerId <= 0 && shouldUseShellWinlatorLaunch(pkg)) containerId = 1;
         PackageManager pm = context.getPackageManager();
         String launchMode = mode == null ? "game" : mode.trim().toLowerCase(Locale.ROOT);
@@ -179,11 +187,9 @@ if (rootUri != null && !rootUri.trim().isEmpty()) {
         List<Intent> intents = new ArrayList<>();
 
         // 官版 v11 源码：Shortcut 直启需要 container_id + shortcut_path。
-        // 旧版/rootfs 模式可能没有 container_id，优先尝试直接把 shortcut_path 交给 XServerDisplayActivity/MainActivity。
-        if ("com.winlator".equalsIgnoreCase(pkg)) {
-            intents.add(addWinlatorExtras(explicit(pkg, "com.winlator.XServerDisplayActivity", Intent.ACTION_MAIN, null), desktopPath, execPath, containerId));
-            if (containerId > 0) intents.add(addWinlatorExtras(explicit(pkg, "com.winlator.XrActivity", Intent.ACTION_MAIN, null), desktopPath, execPath, containerId));
-        }
+        // 改包可能仍保留 com.winlator.* 类名，也可能重打包成 当前包名.*，两种都尝试。
+        addWinlatorActivityCandidates(intents, pkg, "XServerDisplayActivity", desktopPath, execPath, containerId);
+        addWinlatorActivityCandidates(intents, pkg, "XrActivity", desktopPath, execPath, containerId);
 
         intents.add(addWinlatorExtras(new Intent(Intent.ACTION_VIEW).setPackage(pkg).setDataAndType(Uri.fromFile(new File(desktopPath)), "application/x-desktop"), desktopPath, containerId));
 
@@ -204,11 +210,21 @@ if (rootUri != null && !rootUri.trim().isEmpty()) {
         return false;
     }
 
+    private static void addWinlatorActivityCandidates(List<Intent> intents, String pkg, String simpleActivityName, String desktopPath, String execPath, int containerId) {
+        if (intents == null || pkg == null || simpleActivityName == null) return;
+        String p = pkg.trim();
+        if (p.isEmpty()) return;
+        // 严格跟随用户选择的包名，只尝试当前包名下的 Activity，不再补固定的 com.winlator 兜底。
+        List<String> classes = new ArrayList<>();
+        classes.add(p + "." + simpleActivityName);
+        classes.add(p + ".activities." + simpleActivityName);
+        for (String cls : classes) {
+            intents.add(addWinlatorExtras(explicit(p, cls, Intent.ACTION_MAIN, null), desktopPath, execPath, containerId));
+        }
+    }
+
     private static boolean shouldUseShellWinlatorLaunch(String pkg) {
-        if (pkg == null) return false;
-        String p = pkg.trim().toLowerCase(Locale.ROOT);
-        // WinlatorCN/官版/多数改版包名仍是 com.winlator 或包含 winlator。
-        return p.equals("com.winlator") || p.startsWith("com.winlator.") || p.contains("winlator");
+        return isWinlatorPackage(pkg);
     }
 
     private static boolean isGameHubPackage(String pkg) {
@@ -341,7 +357,7 @@ if (rootUri != null && !rootUri.trim().isEmpty()) {
         return i;
     }
 
-    private static String resolveWinlatorExecPathFromDesktop(String desktopPath) {
+    private static String resolveWinlatorExecPathFromDesktop(String desktopPath, String pkg) {
         try {
             File f = new File(desktopPath);
             if (!f.isFile()) return null;
@@ -366,7 +382,8 @@ if (rootUri != null && !rootUri.trim().isEmpty()) {
                     return unixPath + (unixPath.endsWith("/") ? "" : "/") + fileName;
                 }
                 char drive = Character.toLowerCase(exe.charAt(0));
-                return "/data/user/0/com.winlator/files/rootfs/home/xuser/.wine/dosdevices/" + drive + ":" + exe.substring(2);
+                String packageForPath = (pkg == null || pkg.trim().isEmpty()) ? "com.winlator" : pkg.trim();
+                return "/data/user/0/" + packageForPath + "/files/rootfs/home/xuser/.wine/dosdevices/" + drive + ":" + exe.substring(2);
             }
             return exe;
         } catch (Throwable ignored) {
@@ -576,36 +593,180 @@ if (rootUri != null && !rootUri.trim().isEmpty()) {
     }
 
     public static Intent buildInternalArtemisIntent(Context context, String packageName, String gamePath, String launchTarget) {
-        Intent i = new Intent(context, chooseArtemisActivity(packageName));
-        String resolvedPath = resolveInternalArtemisPath(gamePath, launchTarget);
-        Log.i("EmulatorLauncher", "internal Artemis pkg=" + packageName + " root=" + gamePath + " target=" + launchTarget + " resolved=" + resolvedPath);
-        if (resolvedPath != null && !resolvedPath.isEmpty()) {
-            // Tyranor ArtemisActivity uses getIntent().getStringExtra("path") directly
-            // and returns it from getExternalFilesDir(). It expects a normal filesystem path.
-            i.putExtra("path", stripFileScheme(resolvedPath));
-            i.putExtra("gamePath", stripFileScheme(resolvedPath));
-        }
-        i.putExtra("rootUri", gamePath);
-        i.putExtra("launchTarget", launchTarget);
-        i.putExtra("launchMode", "internal.artemis");
-        i.putExtra("orientation", 6);
-        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
-        return i;
-    }
+String resolvedPath = resolveInternalArtemisPath(gamePath, launchTarget);
+String rootPath = stripFileScheme(resolvedPath);
+String path = rootPath;
+boolean scopedSaveDir = context != null && context.getSharedPreferences("yukihub_prefs", Context.MODE_PRIVATE).getBoolean("artemis_scoped_save_dir", false);
+String saveName = safeSaveName(rootPath);
+if (scopedSaveDir) {
+ArtemisMirror mirror = prepareArtemisScopedMirror(context, rootPath, saveName);
+if (mirror != null) {
+Log.i("EmulatorLauncher", "internal Artemis scoped mirror root=" + rootPath + " -> " + mirror.rootPath);
+path = mirror.rootPath;
+}
+}
+Class<?> activityClass = chooseArtemisActivity(packageName, path);
+Intent i = new Intent(context, activityClass);
+Log.i("EmulatorLauncher", "ARTEMIS_SCOPED_V2 pkg=" + packageName + " activity=" + activityClass.getSimpleName() + " root=" + gamePath + " target=" + launchTarget + " resolved=" + resolvedPath + " path=" + path + " scoped=" + scopedSaveDir + " saveName=" + saveName);
+if (path != null && !path.isEmpty()) {
+// The embedded Artemis activity reads getIntent().getStringExtra("path") directly
+// and returns it from getExternalFilesDir(). It expects a normal filesystem path.
+i.putExtra("path", path);
+i.putExtra("gamePath", path);
+}
+i.putExtra("rootUri", gamePath);
+i.putExtra("launchTarget", launchTarget);
+i.putExtra("launchMode", "internal.artemis");
+i.putExtra("orientation", 6);
+i.putExtra("scopedSaveDir", scopedSaveDir);
+i.putExtra("scopedSaveName", saveName);
+i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+return i;
+}
 
     public static Intent buildInternalArtemisIntent(Context context, String gamePath, String launchTarget) {
         return buildInternalArtemisIntent(context, "internal.artemis", gamePath, launchTarget);
     }
 
-    private static Class<?> chooseArtemisActivity(String packageName) {
-        String pkg = packageName == null ? "" : packageName.trim().toLowerCase();
-        if (pkg.contains("v2") || pkg.endsWith(".2")) return com.akira.tyranoemu.remote.ArtemisActivityV3.class;
-        if (pkg.contains("compat")) return com.akira.tyranoemu.remote.ArtemisActivityV2.class;
-        return com.akira.tyranoemu.remote.ArtemisActivityV1.class;
+    private static class ArtemisMirror {
+final String rootPath;
+ArtemisMirror(String rootPath) {
+this.rootPath = rootPath;
+}
+}
+
+private static ArtemisMirror prepareArtemisScopedMirror(Context context, String rootPath, String saveName) {
+if (context == null || rootPath == null || rootPath.trim().isEmpty()) return null;
+try {
+File sourceRoot = new File(rootPath);
+if (!sourceRoot.isDirectory()) return null;
+File internal = context.getFilesDir();
+File external = context.getExternalFilesDir(null);
+if (internal == null || external == null) return null;
+String name = (saveName == null || saveName.trim().isEmpty()) ? safeSaveName(rootPath) : saveName;
+File mirrorRoot = new File(new File(internal, "artemis_mirror"), name);
+File saveRoot = new File(new File(external, "save"), name);
+if (!mirrorRoot.exists() && !mirrorRoot.mkdirs()) return null;
+if (!saveRoot.exists() && !saveRoot.mkdirs()) return null;
+importArtemisExternalSaves(saveRoot, mirrorRoot);
+File[] children = sourceRoot.listFiles();
+int linkCount = 0;
+int skippedSaveCount = 0;
+if (children != null) {
+for (File child : children) {
+if (child == null) continue;
+String childName = child.getName();
+if (childName == null || childName.isEmpty()) continue;
+File link = new File(mirrorRoot, childName);
+if (!isArtemisResourceName(childName)) {
+if (isSymlink(link)) deleteRecursively(link);
+skippedSaveCount++;
+continue;
+}
+if (ensureSymlink(link, child)) linkCount++;
+}
+}
+if (children != null && children.length > 0 && linkCount == 0) return null;
+startArtemisSaveObserver(mirrorRoot, saveRoot);
+Log.i("EmulatorLauncher", "Artemis scoped mirror ready source=" + rootPath + " mirror=" + mirrorRoot.getAbsolutePath() + " save=" + saveRoot.getAbsolutePath() + " links=" + linkCount + " skippedSave=" + skippedSaveCount);
+return new ArtemisMirror(mirrorRoot.getAbsolutePath());
+} catch (Throwable t) {
+Log.w("EmulatorLauncher", "prepare Artemis scoped mirror failed root=" + rootPath, t);
+return null;
+}
+}
+
+private static void importArtemisExternalSaves(File saveRoot, File mirrorRoot) {
+int count = copyRegularFiles(saveRoot, mirrorRoot, false);
+if (count > 0) Log.i("EmulatorLauncher", "Artemis imported external saves count=" + count + " from=" + saveRoot + " to=" + mirrorRoot);
+}
+
+private static void startArtemisSaveObserver(File mirrorRoot, File saveRoot) {
+if (mirrorRoot == null || saveRoot == null) return;
+try {
+final String mirrorPath = mirrorRoot.getAbsolutePath();
+final String savePath = saveRoot.getAbsolutePath();
+FileObserver observer = new FileObserver(mirrorPath, FileObserver.CLOSE_WRITE | FileObserver.MOVED_TO | FileObserver.CREATE) {
+@Override
+public void onEvent(int event, String path) {
+try {
+copyRegularFiles(new File(mirrorPath), new File(savePath), true);
+} catch (Throwable t) {
+Log.w("EmulatorLauncher", "Artemis realtime save export failed", t);
+}
+}
+};
+observer.startWatching();
+ARTEMIS_SAVE_OBSERVERS.add(observer);
+Log.i("EmulatorLauncher", "Artemis save observer started mirror=" + mirrorPath + " save=" + savePath);
+} catch (Throwable t) {
+Log.w("EmulatorLauncher", "Artemis save observer start failed mirror=" + mirrorRoot + " save=" + saveRoot, t);
+}
+}
+
+private static int copyRegularFiles(File fromDir, File toDir, boolean onlyNewer) {
+if (fromDir == null || toDir == null || !fromDir.isDirectory()) return 0;
+if (!toDir.exists() && !toDir.mkdirs()) return 0;
+File[] files = fromDir.listFiles();
+if (files == null) return 0;
+int count = 0;
+for (File src : files) {
+if (src == null || !src.isFile() || isSymlink(src)) continue;
+File dst = new File(toDir, src.getName());
+if (onlyNewer && dst.exists() && dst.lastModified() >= src.lastModified() && dst.length() == src.length()) continue;
+if (copyFile(src, dst)) count++;
+}
+return count;
+}
+
+private static boolean copyFile(File src, File dst) {
+try {
+File parent = dst.getParentFile();
+if (parent != null && !parent.exists() && !parent.mkdirs()) return false;
+byte[] buffer = new byte[64 * 1024];
+try (FileInputStream in = new FileInputStream(src); FileOutputStream out = new FileOutputStream(dst, false)) {
+int read;
+while ((read = in.read(buffer)) != -1) out.write(buffer, 0, read);
+}
+dst.setLastModified(src.lastModified());
+return true;
+} catch (Throwable t) {
+Log.w("EmulatorLauncher", "copy file failed " + src + " -> " + dst, t);
+return false;
+}
+}
+
+private static boolean isArtemisResourceName(String name) {
+if (name == null) return false;
+String n = name.trim().toLowerCase(Locale.ROOT);
+if (n.equals("system") || n.equals("movie")) return true;
+if (n.equals("artemisengine.exe") || n.equals("system.ini")) return true;
+if (n.startsWith("root.pfs")) return true;
+return n.endsWith(".pfs") || n.endsWith(".xp3") || n.endsWith(".arc") || n.endsWith(".pak") || n.endsWith(".dat.arc");
+}
+
+private static String safeSaveName(String rootPath) {
+        try {
+            if (rootPath == null || rootPath.trim().isEmpty()) return "default";
+            File f = new File(rootPath);
+            String name = f.getName();
+            if (name == null || name.trim().isEmpty()) name = String.valueOf(Math.abs(rootPath.hashCode()));
+            name = name.replaceAll("[\\\\/:*?\"<>|]", "_").trim();
+            return name.isEmpty() ? "default" : name;
+        } catch (Throwable ignored) {
+            return "default";
+        }
     }
 
-    private static String resolveInternalArtemisPath(String rootUri, String launchTarget) {
-        // Tyranor's Artemis runner launches by game directory. The .pfs file is only used for detection.
+    private static Class<?> chooseArtemisActivity(String packageName, String rootPath) {
+String pkg = packageName == null ? "" : packageName.trim().toLowerCase(Locale.ROOT);
+if (pkg.contains("compat.v2") || pkg.contains("compatible_v2") || pkg.endsWith(".2")) return com.akira.tyranoemu.remote.ArtemisActivityV3.class;
+if (pkg.contains("compat")) return com.akira.tyranoemu.remote.ArtemisActivityV2.class;
+return com.akira.tyranoemu.remote.ArtemisActivityV1.class;
+}
+
+private static String resolveInternalArtemisPath(String rootUri, String launchTarget) {
+        // Artemis launches by game directory. The .pfs file is only used for detection.
         String rootPath = uriToFilePath(rootUri);
         if (rootPath == null || rootPath.isEmpty()) return rootUri;
         return rootPath;
@@ -632,12 +793,31 @@ if (rootUri != null && !rootUri.trim().isEmpty()) {
     }
 
     public static Intent buildInternalKrkrIntent(Context context, String gamePath, String launchTarget, boolean originMode, boolean compatMode) {
-        Intent i = new Intent(context, originMode ? org.tvp.kirikiri2.KR2Activity.class : com.akira.tyranoemu.remote.Kirikiroid139.class);
-        String resolvedPath = originMode ? null : resolveInternalKrkrPath(gamePath, launchTarget);
+        return buildInternalKrkrIntent(context, gamePath, launchTarget, originMode, compatMode, "auto");
+    }
+
+    public static Intent buildInternalKrkrIntent(Context context, String gamePath, String launchTarget, boolean originMode, boolean compatMode, String engineVersion) {
+        return buildInternalKrkrIntent(context, gamePath, launchTarget, originMode, compatMode, engineVersion, false);
+    }
+
+    public static Intent buildInternalKrkrIntent(Context context, String gamePath, String launchTarget, boolean originMode, boolean compatMode, String engineVersion, boolean safFileFallback) {
+        String resolvedPath = originMode ? null : resolveInternalKrkrPath(context, gamePath, launchTarget);
         String rawRootPath = stripFileScheme(uriToFilePath(gamePath));
         String path = resolvedPath == null ? null : stripFileScheme(resolvedPath);
         String rootPath = krkrRootForPath(rawRootPath, path);
-        Log.i("EmulatorLauncher", "internal KRKR originMode=" + originMode + " root=" + gamePath + " target=" + launchTarget + " resolved=" + resolvedPath + " rootPath=" + rootPath);
+        boolean scopedSaveDir = context != null && context.getSharedPreferences("yukihub_prefs", Context.MODE_PRIVATE).getBoolean("kr_scoped_save_dir", false);
+        String saveName = safeSaveName(rootPath);
+        if (!originMode && scopedSaveDir) {
+            KrkrMirror mirror = prepareKrkrScopedMirror(context, rootPath, path, saveName);
+            if (mirror != null) {
+                Log.i("EmulatorLauncher", "internal KRKR scoped mirror root=" + rootPath + " -> " + mirror.rootPath + " path=" + path + " -> " + mirror.launchPath);
+                rootPath = mirror.rootPath;
+                path = mirror.launchPath;
+            }
+        }
+        boolean use134 = !originMode && shouldUseKrkr134(rootPath, engineVersion);
+        Intent i = new Intent(context, originMode ? org.tvp.kirikiri2.KR2Activity.class : (use134 ? com.akira.tyranoemu.remote.Kirikiroid134.class : com.akira.tyranoemu.remote.Kirikiroid139.class));
+        Log.i("EmulatorLauncher", "internal KRKR originMode=" + originMode + " engineVersion=" + normalizeKrkrEngineVersion(engineVersion) + " use134=" + use134 + " root=" + gamePath + " target=" + launchTarget + " resolved=" + resolvedPath + " rootPath=" + rootPath);
         if (path != null && !path.isEmpty()) {
             // 普通模式也使用普通文件路径，让默认启动链更接近原生 KRKR / TY 的读取方式。
             i.putExtra("path", path);
@@ -659,14 +839,128 @@ if (rootUri != null && !rootUri.trim().isEmpty()) {
         i.putExtra("focus", "true");
         if (!originMode && compatMode) i.putExtra("maps", true);
         i.putExtra("compatMode", compatMode);
+        i.putExtra("krEngineVersion", use134 ? "1.3.4" : "1.3.9");
         i.putExtra("orientation", 6);
         i.putExtra("launchMode", originMode ? "internal.krkr.origin" : "internal.krkr");
+        i.putExtra("scopedSaveDir", scopedSaveDir);
+        i.putExtra("scopedSaveName", saveName);
+        i.putExtra("safFileFallback", safFileFallback);
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
         return i;
     }
 
-    private static String resolveInternalKrkrPath(String rootUri, String launchTarget) {
-        // 对齐 Tyranor/Kirikiroid 的思路：
+    private static class KrkrMirror {
+        final String rootPath;
+        final String launchPath;
+        KrkrMirror(String rootPath, String launchPath) {
+            this.rootPath = rootPath;
+            this.launchPath = launchPath;
+        }
+    }
+
+    private static KrkrMirror prepareKrkrScopedMirror(Context context, String rootPath, String launchPath, String saveName) {
+        if (context == null || rootPath == null || rootPath.trim().isEmpty()) return null;
+        try {
+            File sourceRoot = new File(rootPath);
+            if (!sourceRoot.isDirectory()) return null;
+            File internal = context.getFilesDir();
+            File external = context.getExternalFilesDir(null);
+            if (internal == null || external == null) return null;
+            String name = (saveName == null || saveName.trim().isEmpty()) ? safeSaveName(rootPath) : saveName;
+            File mirrorRoot = new File(new File(internal, "krkr_mirror"), name);
+            File saveRoot = new File(new File(external, "save"), name);
+            if (!mirrorRoot.exists() && !mirrorRoot.mkdirs()) return null;
+            if (!saveRoot.exists() && !saveRoot.mkdirs()) return null;
+            File mirrorSave = new File(mirrorRoot, "savedata");
+            if (!ensureSymlink(mirrorSave, saveRoot)) return null;
+            File[] children = sourceRoot.listFiles();
+            if (children != null) {
+                for (File child : children) {
+                    if (child == null) continue;
+                    String childName = child.getName();
+                    if (childName == null || childName.isEmpty()) continue;
+                    if ("savedata".equalsIgnoreCase(childName)) continue;
+                    File link = new File(mirrorRoot, childName);
+                    ensureSymlink(link, child);
+                }
+            }
+            String mappedLaunch = mapPathIntoMirror(rootPath, launchPath, mirrorRoot.getAbsolutePath());
+            Log.i("EmulatorLauncher", "KRKR scoped mirror ready source=" + rootPath + " mirror=" + mirrorRoot.getAbsolutePath() + " save=" + saveRoot.getAbsolutePath());
+            return new KrkrMirror(mirrorRoot.getAbsolutePath(), mappedLaunch);
+        } catch (Throwable t) {
+            Log.w("EmulatorLauncher", "prepare KRKR scoped mirror failed root=" + rootPath + " path=" + launchPath, t);
+            return null;
+        }
+    }
+
+    private static boolean ensureSymlink(File link, File target) {
+        try {
+            if (link.exists()) {
+                if (isSymlinkTo(link, target)) return true;
+                deleteRecursively(link);
+            }
+            Os.symlink(target.getAbsolutePath(), link.getAbsolutePath());
+            return isSymlinkTo(link, target);
+        } catch (ErrnoException e) {
+            Log.w("EmulatorLauncher", "symlink failed " + link + " -> " + target, e);
+            return false;
+        }
+    }
+
+    private static boolean isSymlinkTo(File link, File target) {
+        try {
+            String current = Os.readlink(link.getAbsolutePath());
+            return target.getAbsolutePath().equals(current);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static void deleteRecursively(File file) {
+        if (file == null || !file.exists()) return;
+        if (file.isDirectory() && !isSymlink(file)) {
+            File[] children = file.listFiles();
+            if (children != null) for (File child : children) deleteRecursively(child);
+        }
+        if (!file.delete()) Log.w("EmulatorLauncher", "delete failed " + file.getAbsolutePath());
+    }
+
+    private static boolean isSymlink(File file) {
+        try {
+            Os.readlink(file.getAbsolutePath());
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static String mapPathIntoMirror(String sourceRoot, String launchPath, String mirrorRoot) {
+        if (launchPath == null || launchPath.trim().isEmpty()) return mirrorRoot;
+        String src = stripFileScheme(sourceRoot);
+        String path = stripFileScheme(launchPath);
+        if (src == null || path == null) return mirrorRoot;
+        while (src.endsWith("/") && src.length() > 1) src = src.substring(0, src.length() - 1);
+        if (path.equals(src)) return mirrorRoot;
+        if (path.startsWith(src + "/")) return mirrorRoot + path.substring(src.length());
+        return path;
+    }
+
+    private static boolean shouldUseKrkr134(String rootPath, String engineVersion) {
+        String mode = normalizeKrkrEngineVersion(engineVersion);
+        return "1.3.4".equals(mode);
+    }
+
+    private static String normalizeKrkrEngineVersion(String engineVersion) {
+        String mode = engineVersion == null ? "auto" : engineVersion.trim().toLowerCase(Locale.ROOT);
+        if (mode.equals("134") || mode.equals("1.3.4") || mode.equals("kr134") || mode.equals("kirikiroid134")) return "1.3.4";
+        if (mode.equals("139") || mode.equals("1.3.9") || mode.equals("kr139") || mode.equals("kirikiroid139")) return "1.3.9";
+        return "auto";
+    }
+
+    // KR 引擎版本只由全局设置决定，不再读取单个游戏目录标记。
+
+    private static String resolveInternalKrkrPath(Context context, String rootUri, String launchTarget) {
+        // 对齐 Kirikiroid 的思路：
         // 1) 优先解析为真正的入口文件
         // 2) 其次才退回目录本身
         String rootPath = stripFileScheme(uriToFilePath(rootUri));
@@ -677,7 +971,9 @@ if (rootUri != null && !rootUri.trim().isEmpty()) {
         }
         if ("XP3_FIRST".equalsIgnoreCase(target)) {
             String firstXp3 = findFirstChildBySuffix(rootPath, ".xp3");
-            return firstXp3 == null ? rootPath : firstXp3;
+            if (firstXp3 != null) return firstXp3;
+            String safFirstXp3 = findKrkrPreferredEntryFromTree(context, rootUri, rootPath);
+            return safFirstXp3 == null ? rootPath : safFirstXp3;
         }
         if (target.startsWith("/")) {
             File f = new File(target);
@@ -687,11 +983,11 @@ if (rootUri != null && !rootUri.trim().isEmpty()) {
         File targetFile = new File(root, target);
         if (targetFile.isFile()) return targetFile.getAbsolutePath();
         if (targetFile.isDirectory()) return targetFile.getAbsolutePath();
+        String safTarget = findKrkrTargetFromTree(context, rootUri, rootPath, target);
+        if (safTarget != null) return safTarget;
         if (target.endsWith(".xp3") || target.endsWith(".tjs") || target.endsWith(".exe") || target.endsWith(".dll")) {
             return targetFile.getAbsolutePath();
         }
-        String preferred = findKrkrPreferredEntry(rootPath);
-        if (preferred != null) return preferred;
         return rootPath;
     }
 
@@ -707,6 +1003,49 @@ if (rootUri != null && !rootUri.trim().isEmpty()) {
             }
         } catch (Throwable ignored) { }
         return findFirstChildBySuffix(rootPath, ".xp3");
+    }
+
+    private static String findKrkrPreferredEntryFromTree(Context context, String rootUri, String rootPath) {
+        String[] names = new String[]{"data.xp3", "startup.tjs", "patch.xp3"};
+        for (String name : names) {
+            String p = findKrkrTargetFromTree(context, rootUri, rootPath, name);
+            if (p != null) return p;
+        }
+        try {
+            DocumentFile dir = DocumentFile.fromTreeUri(context, Uri.parse(rootUri));
+            if (dir == null || !dir.isDirectory()) return null;
+            DocumentFile[] files = dir.listFiles();
+            if (files == null) return null;
+            for (DocumentFile file : files) {
+                if (file == null || !file.isFile()) continue;
+                String name = file.getName();
+                if (name != null && name.toLowerCase(Locale.ROOT).endsWith(".xp3")) {
+                    return rootPath.endsWith("/") ? rootPath + name : rootPath + "/" + name;
+                }
+            }
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    private static String findKrkrTargetFromTree(Context context, String rootUri, String rootPath, String target) {
+        if (context == null || rootUri == null || target == null || target.trim().isEmpty()) return null;
+        try {
+            DocumentFile dir = DocumentFile.fromTreeUri(context, Uri.parse(rootUri));
+            if (dir == null || !dir.isDirectory()) return null;
+            String[] parts = target.split("/");
+            DocumentFile current = dir;
+            for (String part : parts) {
+                if (part == null || part.isEmpty() || ".".equals(part)) continue;
+                current = current == null ? null : current.findFile(part);
+                if (current == null) return null;
+            }
+            if (current != null && current.exists() && current.isFile()) {
+                String cleanTarget = target;
+                while (cleanTarget.startsWith("/")) cleanTarget = cleanTarget.substring(1);
+                return rootPath.endsWith("/") ? rootPath + cleanTarget : rootPath + "/" + cleanTarget;
+            }
+        } catch (Throwable ignored) { }
+        return null;
     }
 
     private static String krkrRootForPath(String rawRootPath, String launchPath) {
